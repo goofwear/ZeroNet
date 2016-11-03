@@ -12,20 +12,38 @@ monkey.patch_all()
 
 
 def update():
-    # Gevent https bug workaround (https://github.com/gevent/gevent/issues/477)
-    reload(socket)
-    reload(httplib)
-    reload(ssl)
+    from src.util import helper
 
-    print "Downloading.",
-    file = urllib.urlopen("https://github.com/HelloZeroNet/ZeroNet/archive/master.zip")
-    data = StringIO.StringIO()
-    while True:
-        buff = file.read(1024 * 16)
-        if not buff:
-            break
-        data.write(buff)
-        print ".",
+    urls = [
+        "https://github.com/HelloZeroNet/ZeroNet/archive/master.zip",
+        "https://gitlab.com/HelloZeroNet/ZeroNet/repository/archive.zip?ref=master",
+        "https://try.gogs.io/ZeroNet/ZeroNet/archive/master.zip"
+    ]
+
+    zipdata = None
+    for url in urls:
+        print "Downloading from:", url,
+        try:
+            req = helper.httpRequest(url)
+            data = StringIO.StringIO()
+            while True:
+                buff = req.read(1024 * 16)
+                if not buff:
+                    break
+                data.write(buff)
+                print ".",
+            try:
+                zipdata = zipfile.ZipFile(data)
+                break  # Success
+            except Exception, err:
+                data.seek(0)
+                print "Unpack error", err, data.read(256)
+        except Exception, err:
+            print "Error downloading update from %s: %s" % (url, err)
+
+    if not zipdata:
+        raise err
+
     print "Downloaded."
 
     # Checking plugins
@@ -40,13 +58,13 @@ def update():
         print "Plugins enabled:", plugins_enabled, "disabled:", plugins_disabled
 
     print "Extracting...",
-    zip = zipfile.ZipFile(data)
-    for inner_path in zip.namelist():
+    for inner_path in zipdata.namelist():
         if ".." in inner_path:
             continue
         inner_path = inner_path.replace("\\", "/")  # Make sure we have unix path
         print ".",
-        dest_path = inner_path.replace("ZeroNet-master/", "")
+        dest_path = re.sub("^[^/]*-master.*?/", "", inner_path)  # Skip root zeronet-master-... like directories
+        dest_path = dest_path.lstrip("/")
         if not dest_path:
             continue
 
@@ -66,16 +84,24 @@ def update():
             os.makedirs(dest_dir)
 
         if dest_dir != dest_path.strip("/"):
-            data = zip.read(inner_path)
+            data = zipdata.read(inner_path)
             try:
                 open(dest_path, 'wb').write(data)
             except Exception, err:
                 print dest_path, err
 
     print "Done."
+    return True
 
 
 if __name__ == "__main__":
+    # Fix broken gevent SSL
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))  # Imports relative to src
+    from Config import config
+    config.parse()
+    from src.util import SslPatch
+
     try:
         update()
     except Exception, err:

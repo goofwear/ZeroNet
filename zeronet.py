@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2.7
 
 # Included modules
 import os
@@ -49,6 +49,8 @@ def main():
         # Restart
         gc.collect()  # Garbage collect
         print "Restarting..."
+        import time
+        time.sleep(1)  # Wait files to close
         args = sys.argv[:]
         args.insert(0, sys.executable)
         if sys.platform == 'win32':

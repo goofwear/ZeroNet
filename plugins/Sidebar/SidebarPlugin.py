@@ -4,6 +4,7 @@ import cgi
 import sys
 import math
 import time
+import json
 try:
     import cStringIO as StringIO
 except:
@@ -65,14 +66,16 @@ class UiWebsocketPlugin(object):
         if peers_total:
             percent_connected = float(connected) / peers_total
             percent_connectable = float(connectable) / peers_total
+            percent_onion = float(onion) / peers_total
         else:
-            percent_connectable = percent_connected = 0
+            percent_connectable = percent_connected = percent_onion = 0
         body.append("""
             <li>
              <label>Peers</label>
              <ul class='graph'>
               <li style='width: 100%' class='total back-black' title="Total peers"></li>
               <li style='width: {percent_connectable:.0%}' class='connectable back-blue' title='Connectable peers'></li>
+              <li style='width: {percent_onion:.0%}' class='connected back-purple' title='Onion'></li>
               <li style='width: {percent_connected:.0%}' class='connected back-green' title='Connected peers'></li>
              </ul>
              <ul class='graph-legend'>
@@ -116,28 +119,45 @@ class UiWebsocketPlugin(object):
             ("css", "orange"),
             ("js", "purple"),
             ("image", "green"),
-            ("json", "blue"),
+            ("json", "darkblue"),
+            ("user data", "blue"),
             ("other", "white"),
             ("total", "black")
         )
         # Collect stats
         size_filetypes = {}
         size_total = 0
-        for content in site.content_manager.contents.values():
+        contents = site.content_manager.listContents()  # Without user files
+        for inner_path in contents:
+            content = site.content_manager.contents[inner_path]
             if "files" not in content:
                 continue
             for file_name, file_details in content["files"].items():
                 size_total += file_details["size"]
                 ext = file_name.split(".")[-1]
                 size_filetypes[ext] = size_filetypes.get(ext, 0) + file_details["size"]
-        size_other = size_total
+
+        # Get user file sizes
+        size_user_content = site.content_manager.contents.execute(
+            "SELECT SUM(size) + SUM(size_files) AS size FROM content WHERE ?",
+            {"not__inner_path": contents}
+        ).fetchone()["size"]
+        if not size_user_content:
+            size_user_content = 0
+        size_filetypes["user data"] = size_user_content
+        size_total += size_user_content
+
+        # The missing difference is content.json sizes
+        if "json" in size_filetypes:
+            size_filetypes["json"] += max(0, site.settings["size"] - size_total)
+        size_total = size_other = site.settings["size"]
 
         # Bar
         for extension, color in extensions:
             if extension == "total":
                 continue
             if extension == "other":
-                size = size_other
+                size = max(0, size_other)
             elif extension == "image":
                 size = size_filetypes.get("jpg", 0) + size_filetypes.get("png", 0) + size_filetypes.get("gif", 0)
                 size_other -= size
@@ -148,14 +168,17 @@ class UiWebsocketPlugin(object):
                 percent = 0
             else:
                 percent = 100 * (float(size) / size_total)
-            percent = math.floor(percent*100)/100  # Floor to 2 digits
-            body.append(u"""<li style='width: %.2f%%' class='%s back-%s' title="%s"></li>""" % (percent, extension, color, extension))
+            percent = math.floor(percent * 100) / 100  # Floor to 2 digits
+            body.append(
+                u"""<li style='width: %.2f%%' class='%s back-%s' title="%s"></li>""" %
+                (percent, extension, color, extension)
+            )
 
         # Legend
         body.append("</ul><ul class='graph-legend'>")
         for extension, color in extensions:
             if extension == "other":
-                size = size_other
+                size = max(0, size_other)
             elif extension == "image":
                 size = size_filetypes.get("jpg", 0) + size_filetypes.get("png", 0) + size_filetypes.get("gif", 0)
             elif extension == "total":
@@ -210,9 +233,10 @@ class UiWebsocketPlugin(object):
     def sidebarRenderOptionalFileStats(self, body, site):
         size_total = 0.0
         size_downloaded = 0.0
-        for content in site.content_manager.contents.values():
-            if "files_optional" not in content:
-                continue
+        res = site.content_manager.contents.execute("SELECT inner_path FROM content WHERE size_files_optional > 0 AND site_id = :site_id")
+        for row in res:
+            inner_path = row["inner_path"]
+            content = site.content_manager.contents[inner_path]
             for file_name, file_details in content["files_optional"].items():
                 size_total += file_details["size"]
                 if site.content_manager.hashfield.hasHash(file_details["sha512"]):
@@ -261,8 +285,17 @@ class UiWebsocketPlugin(object):
              <ul class='filelist'>
         """)
 
-        for bad_file in site.bad_files.keys():
-            body.append("""<li class='color-red' title="%s">%s</li>""" % (cgi.escape(bad_file, True), cgi.escape(bad_file, True)))
+        i = 0
+        for bad_file, tries in site.bad_files.iteritems():
+            i += 1
+            body.append("""<li class='color-red' title="%s (%s tries)">%s</li>""" % (
+                cgi.escape(bad_file, True), tries, cgi.escape(bad_file, True))
+            )
+            if i > 30:
+                break
+
+        if len(site.bad_files) > 30:
+            body.append("""<li class='color-red'>+ %s more</li>""" % (len(site.bad_files) - 30))
 
         body.append("""
              </ul>
@@ -270,26 +303,71 @@ class UiWebsocketPlugin(object):
         """)
 
     def sidebarRenderDbOptions(self, body, site):
-        if not site.storage.db:
-            return False
+        if site.storage.db:
+            inner_path = site.storage.getInnerPath(site.storage.db.db_path)
+            size = float(site.storage.getSize(inner_path)) / 1024
+            feeds = len(site.storage.db.schema.get("feeds", {}))
+        else:
+            inner_path = "No database found"
+            size = 0.0
+            feeds = 0
 
-        inner_path = site.storage.getInnerPath(site.storage.db.db_path)
-        size = float(site.storage.getSize(inner_path)) / 1024
         body.append(u"""
             <li>
-             <label>Database <small>({size:.2f}kB)</small></label>
-             <input type='text' class='text disabled' value="{inner_path}" disabled='disabled'/>
-             <a href='#Reindex' class='button' style='display: none'>Reindex</a>
+             <label>Database <small>({size:.2f}kB, search feeds: {feeds} query)</small></label>
+             <input type='text' class='text disabled' value="{inner_path}" disabled='disabled' style='width: 180px;'/>
+             <a href='#Reload' id="button-dbreload" class='button'>Reload</a>
+             <a href='#Rebuild' id="button-dbrebuild" class='button'>Rebuild</a>
             </li>
         """.format(**locals()))
 
     def sidebarRenderIdentity(self, body, site):
         auth_address = self.user.getAuthAddress(self.site.address)
+        rules = self.site.content_manager.getRules("data/users/%s/content.json" % auth_address)
+        if rules and rules.get("max_size"):
+            quota = rules["max_size"] / 1024
+            try:
+                content = site.content_manager.contents["data/users/%s/content.json" % auth_address]
+                used = len(json.dumps(content)) + sum([file["size"] for file in content["files"].values()])
+            except:
+                used = 0
+            used = used / 1024
+        else:
+            quota = used = 0
+
         body.append("""
             <li>
-             <label>Identity address</label>
+             <label>Identity address <small>(limit used: {used:.2f}kB / {quota:.2f}kB)</small></label>
              <span class='input text disabled'>{auth_address}</span>
              <a href='#Change' class='button' id='button-identity'>Change</a>
+            </li>
+        """.format(**locals()))
+
+    def sidebarRenderControls(self, body, site):
+        auth_address = self.user.getAuthAddress(self.site.address)
+        if self.site.settings["serving"]:
+            class_pause = ""
+            class_resume = "hidden"
+        else:
+            class_pause = "hidden"
+            class_resume = ""
+
+        body.append("""
+            <li>
+             <label>Site control</label>
+             <a href='#Update' class='button noupdate' id='button-update'>Update</a>
+             <a href='#Pause' class='button {class_pause}' id='button-pause'>Pause</a>
+             <a href='#Resume' class='button {class_resume}' id='button-resume'>Resume</a>
+             <a href='#Delete' class='button noupdate' id='button-delete'>Delete</a>
+            </li>
+        """.format(**locals()))
+
+        site_address = self.site.address
+        body.append("""
+            <li>
+             <label>Site address</label><br>
+             <span class='input text disabled'>{site_address}</span>
+             <a href='bitcoin:{site_address}' class='button' id='button-donate'>Donate</a>
             </li>
         """.format(**locals()))
 
@@ -334,15 +412,20 @@ class UiWebsocketPlugin(object):
         body.append("""
             <li>
              <label>Content publishing</label>
-             <select id='select-contents'>
         """)
 
-        for inner_path in sorted(site.content_manager.contents.keys()):
-            body.append(u"<option>%s</option>" % cgi.escape(inner_path, True))
+        # Choose content you want to sign
+        contents = ["content.json"]
+        contents += site.content_manager.contents.get("content.json", {}).get("includes", {}).keys()
+        if len(contents) > 1:
+            body.append("<div class='contents'>Choose: ")
+            for content in contents:
+                content = cgi.escape(content, True)
+                body.append("<a href='#{content}' onclick='$(\"#input-contents\").val(\"{content}\"); return false'>{content}</a> ".format(**locals()))
+            body.append("</div>")
 
         body.append("""
-             </select>
-             <span class='select-down'>&rsaquo;</span>
+             <input type='text' class='text' value="content.json" id='input-contents' style='width: 201px'/>
              <a href='#Sign' class='button' id='button-sign'>Sign</a>
              <a href='#Publish' class='button' id='button-publish'>Publish</a>
             </li>
@@ -367,10 +450,11 @@ class UiWebsocketPlugin(object):
         has_optional = self.sidebarRenderOptionalFileStats(body, site)
         if has_optional:
             self.sidebarRenderOptionalFileSettings(body, site)
-        if site.bad_files:
-            self.sidebarRenderBadFiles(body, site)
         self.sidebarRenderDbOptions(body, site)
         self.sidebarRenderIdentity(body, site)
+        self.sidebarRenderControls(body, site)
+        if site.bad_files:
+            self.sidebarRenderBadFiles(body, site)
 
         self.sidebarRenderOwnedCheckbox(body, site)
         body.append("<div class='settings-owned'>")
@@ -389,9 +473,9 @@ class UiWebsocketPlugin(object):
         from util import helper
 
         self.log.info("Downloading GeoLite2 City database...")
-        self.cmd("notification", ["geolite-info", "Downloading GeoLite2 City database (one time only, ~15MB)...", 0])
+        self.cmd("notification", ["geolite-info", "Downloading GeoLite2 City database (one time only, ~20MB)...", 0])
         db_urls = [
-            "http://geolite.maxmind.com/download/geoip/database/GeoLite2-City.mmdb.gz",
+            "https://geolite.maxmind.com/download/geoip/database/GeoLite2-City.mmdb.gz",
             "https://raw.githubusercontent.com/texnikru/GeoLite2-Database/master/GeoLite2-City.mmdb.gz"
         ]
         for db_url in db_urls:
@@ -492,14 +576,43 @@ class UiWebsocketPlugin(object):
 
     def actionSiteSetOwned(self, to, owned):
         permissions = self.getPermissions(to)
+
+        if "Multiuser" in PluginManager.plugin_manager.plugin_names:
+            self.cmd("notification", ["info", "This function is disabled on this proxy"])
+            return False
+
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
         self.site.settings["own"] = bool(owned)
 
     def actionSiteSetAutodownloadoptional(self, to, owned):
         permissions = self.getPermissions(to)
+
+        if "Multiuser" in PluginManager.plugin_manager.plugin_names:
+            self.cmd("notification", ["info", "This function is disabled on this proxy"])
+            return False
+
         if "ADMIN" not in permissions:
             return self.response(to, "You don't have permission to run this command")
         self.site.settings["autodownloadoptional"] = bool(owned)
-        self.site.update()
+        self.site.update(check_files=True)
         self.site.worker_manager.removeGoodFileTasks()
+
+    def actionDbReload(self, to):
+        permissions = self.getPermissions(to)
+        if "ADMIN" not in permissions:
+            return self.response(to, "You don't have permission to run this command")
+
+        self.site.storage.closeDb()
+        self.site.storage.getDb()
+
+        return self.response(to, "ok")
+
+    def actionDbRebuild(self, to):
+        permissions = self.getPermissions(to)
+        if "ADMIN" not in permissions:
+            return self.response(to, "You don't have permission to run this command")
+
+        self.site.storage.rebuildDb()
+
+        return self.response(to, "ok")

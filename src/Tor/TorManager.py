@@ -90,7 +90,10 @@ class TorManager:
 
     def stopTor(self):
         self.log.debug("Stopping...")
-        self.tor_process.terminate()
+        try:
+            self.tor_process.terminate()
+        except Exception, err:
+            self.log.error("Error stopping Tor: %s" % err)
 
     def downloadTor(self):
         self.log.info("Downloading Tor...")
@@ -151,9 +154,9 @@ class TorManager:
                 conn.connect((self.ip, self.port))
                 res_protocol = self.send("PROTOCOLINFO", conn)
 
-                version = re.search('Tor="([0-9\.]+)"', res_protocol).group(1)
+                version = re.search('Tor="([0-9\.]+)', res_protocol).group(1)
                 # Version 0.2.7.5 required because ADD_ONION support
-                assert int(version.replace(".", "0")) >= 20705, "Tor version >=0.2.7.5 required"
+                assert float(version.replace(".", "0", 2)) >= 207.5, "Tor version >=0.2.7.5 required, found: %s" % version
 
                 # Auth cookie file
                 cookie_match = re.search('COOKIEFILE="(.*?)"', res_protocol)
@@ -165,12 +168,12 @@ class TorManager:
                     res_auth = self.send("AUTHENTICATE", conn)
 
                 assert "250 OK" in res_auth, "Authenticate error %s" % res_auth
-                self.status = "Connected (%s)" % res_auth
+                self.status = u"Connected (%s)" % res_auth
                 self.conn = conn
         except Exception, err:
             self.conn = None
-            self.status = "Error (%s)" % err
-            self.log.error("Tor controller connect error: %s" % err)
+            self.status = u"Error (%s)" % err
+            self.log.error("Tor controller connect error: %s" % Debug.formatException(err))
             self.enabled = False
         return self.conn
 
@@ -179,14 +182,15 @@ class TorManager:
         self.conn = None
 
     def startOnions(self):
-        self.log.debug("Start onions")
-        self.start_onions = True
+        if self.enabled:
+            self.log.debug("Start onions")
+            self.start_onions = True
 
     # Get new exit node ip
     def resetCircuits(self):
         res = self.request("SIGNAL NEWNYM")
         if "250 OK" not in res:
-            self.status = "Reset circuits error (%s)" % res
+            self.status = u"Reset circuits error (%s)" % res
             self.log.error("Tor reset circuits error: %s" % res)
 
     def addOnion(self):
@@ -195,11 +199,11 @@ class TorManager:
         if match:
             onion_address, onion_privatekey = match.groups()
             self.privatekeys[onion_address] = onion_privatekey
-            self.status = "OK (%s onion running)" % len(self.privatekeys)
+            self.status = u"OK (%s onion running)" % len(self.privatekeys)
             SiteManager.peer_blacklist.append((onion_address + ".onion", self.fileserver_port))
             return onion_address
         else:
-            self.status = "AddOnion error (%s)" % res
+            self.status = u"AddOnion error (%s)" % res
             self.log.error("Tor addOnion error: %s" % res)
             return False
 
@@ -210,7 +214,7 @@ class TorManager:
             self.status = "OK (%s onion running)" % len(self.privatekeys)
             return True
         else:
-            self.status = "DelOnion error (%s)" % res
+            self.status = u"DelOnion error (%s)" % res
             self.log.error("Tor delOnion error: %s" % res)
             self.disconnect()
             return False
@@ -228,8 +232,17 @@ class TorManager:
         if not conn:
             conn = self.conn
         self.log.debug("> %s" % cmd)
-        conn.send("%s\r\n" % cmd)
-        back = conn.recv(1024 * 64)
+        for retry in range(2):
+            try:
+                conn.send("%s\r\n" % cmd)
+                back = conn.recv(1024 * 64).decode("utf8", "ignore")
+                break
+            except Exception, err:
+                self.log.error("Tor send error: %s, reconnecting..." % err)
+                self.disconnect()
+                time.sleep(1)
+                self.connect()
+                back = None
         self.log.debug("< %s" % back.strip())
         return back
 

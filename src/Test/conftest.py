@@ -4,6 +4,7 @@ import urllib
 import time
 import logging
 import json
+import shutil
 
 import pytest
 import mock
@@ -24,31 +25,48 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + "/.."))  # Import
 
 from Config import config
 config.argv = ["none"]  # Dont pass any argv to config parser
-config.parse()
-config.data_dir = "src/Test/testdata"  # Use test data for unittests
-config.debug_socket = True  # Use test data for unittests
-config.tor = "disabled"  # Don't start Tor client
+config.parse()  # Plugins need to access the configuration
 logging.basicConfig(level=logging.DEBUG, stream=sys.stdout)
 
 from Plugin import PluginManager
 PluginManager.plugin_manager.loadPlugins()
+config.loadPlugins()
+config.parse()  # Parse again to add plugin configuration options
+
+config.data_dir = "src/Test/testdata"  # Use test data for unittests
+config.debug_socket = True  # Use test data for unittests
+config.verbose = True  # Use test data for unittests
+config.tor = "disabled"  # Don't start Tor client
+config.trackers = []
+
+os.chdir(os.path.abspath(os.path.dirname(__file__) + "/../.."))  # Set working dir
+# Cleanup content.db caches
+if os.path.isfile("%s/content.db" % config.data_dir):
+    os.unlink("%s/content.db" % config.data_dir)
+if os.path.isfile("%s-temp/content.db" % config.data_dir):
+    os.unlink("%s-temp/content.db" % config.data_dir)
 
 import gevent
 from gevent import monkey
 monkey.patch_all(thread=False)
 
 from Site import Site
+from Site import SiteManager
 from User import UserManager
 from File import FileServer
 from Connection import ConnectionServer
 from Crypt import CryptConnection
 from Ui import UiWebsocket
 from Tor import TorManager
+from Content import ContentDb
+from util import RateLimit
+
+# SiteManager.site_manager.load = mock.MagicMock(return_value=True)  # Don't try to load from sites.json
+# SiteManager.site_manager.save = mock.MagicMock(return_value=True)  # Don't try to load from sites.json
 
 
 @pytest.fixture(scope="session")
 def resetSettings(request):
-    os.chdir(os.path.abspath(os.path.dirname(__file__) + "/../.."))  # Set working dir
     open("%s/sites.json" % config.data_dir, "w").write("{}")
     open("%s/users.json" % config.data_dir, "w").write("""
         {
@@ -59,12 +77,6 @@ def resetSettings(request):
             }
         }
     """)
-
-    def cleanup():
-        os.unlink("%s/sites.json" % config.data_dir)
-        os.unlink("%s/users.json" % config.data_dir)
-    request.addfinalizer(cleanup)
-
 
 @pytest.fixture(scope="session")
 def resetTempSettings(request):
@@ -89,8 +101,32 @@ def resetTempSettings(request):
 
 
 @pytest.fixture()
-def site():
+def site(request):
+    # Reset ratelimit
+    RateLimit.queue_db = {}
+    RateLimit.called_db = {}
+
     site = Site("1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT")
+    site.announce = mock.MagicMock(return_value=True)  # Don't try to find peers from the net
+
+    # Always use original data
+    assert "1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT" in site.storage.getPath("")  # Make sure we dont delete everything
+    shutil.rmtree(site.storage.getPath(""), True)
+    shutil.copytree(site.storage.getPath("") + "-original", site.storage.getPath(""))
+    def cleanup():
+        site.storage.deleteFiles()
+        site.content_manager.contents.db.deleteSite("1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT")
+        del SiteManager.site_manager.sites["1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT"]
+        site.content_manager.contents.db.close()
+        db_path = "%s/content.db" % config.data_dir
+        os.unlink(db_path)
+        del ContentDb.content_dbs[db_path]
+    request.addfinalizer(cleanup)
+
+    site = Site("1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT")  # Create new Site object to load content.json files
+    if not SiteManager.site_manager.sites:
+        SiteManager.site_manager.sites = {}
+    SiteManager.site_manager.sites["1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT"] = site
     return site
 
 
@@ -98,9 +134,15 @@ def site():
 def site_temp(request):
     with mock.patch("Config.config.data_dir", config.data_dir + "-temp"):
         site_temp = Site("1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT")
+        site_temp.announce = mock.MagicMock(return_value=True)  # Don't try to find peers from the net
 
     def cleanup():
         site_temp.storage.deleteFiles()
+        site_temp.content_manager.contents.db.deleteSite("1TeSTvb4w2PWE81S2rEELgmX2GCCExQGT")
+        site_temp.content_manager.contents.db.close()
+        db_path = "%s-temp/content.db" % config.data_dir
+        os.unlink(db_path)
+        del ContentDb.content_dbs[db_path]
     request.addfinalizer(cleanup)
     return site_temp
 
@@ -137,7 +179,15 @@ def file_server(request):
     request.addfinalizer(CryptConnection.manager.removeCerts)  # Remove cert files after end
     file_server = FileServer("127.0.0.1", 1544)
     gevent.spawn(lambda: ConnectionServer.start(file_server))
-    time.sleep(0)  # Port opening
+    # Wait for port opening
+    for retry in range(10):
+        time.sleep(0.1)  # Port opening
+        try:
+            conn = file_server.getConnection("127.0.0.1", 1544)
+            conn.close()
+            break
+        except Exception, err:
+            print err
     assert file_server.running
 
     def stop():

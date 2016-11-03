@@ -7,8 +7,8 @@ import ConfigParser
 class Config(object):
 
     def __init__(self, argv):
-        self.version = "0.3.6"
-        self.rev = 914
+        self.version = "0.4.1"
+        self.rev = 1536
         self.argv = argv
         self.action = None
         self.config_file = "zeronet.conf"
@@ -38,7 +38,7 @@ class Config(object):
             "udp://9.rarbg.com:2710",
             "http://tracker.aletorrenty.pl:2710/announce",
             "http://explodie.org:6969/announce",
-            "http://torrent.gresille.org/announce"
+            "http://tracker1.wasabii.com.tw:6969/announce"
         ]
         # Platform specific
         if sys.platform.startswith("win"):
@@ -58,6 +58,10 @@ class Config(object):
         action = self.subparsers.add_parser("siteNeedFile", help='Get a file from site')
         action.add_argument('address', help='Site address')
         action.add_argument('inner_path', help='File inner path')
+
+        # SiteDownload
+        action = self.subparsers.add_parser("siteDownload", help='Download a new site')
+        action.add_argument('address', help='Site address')
 
         # SiteSign
         action = self.subparsers.add_parser("siteSign", help='Update and sign content.json: address [privatekey]')
@@ -116,8 +120,10 @@ class Config(object):
         action.add_argument('privatekey', help='Private key')
 
         # Config parameters
+        self.parser.add_argument('--verbose', help='More detailed logging', action='store_true')
         self.parser.add_argument('--debug', help='Debug mode', action='store_true')
         self.parser.add_argument('--debug_socket', help='Debug socket connections', action='store_true')
+        self.parser.add_argument('--debug_gevent', help='Debug gevent functions', action='store_true')
 
         self.parser.add_argument('--batch', help="Batch mode (No interactive input for commands)", action='store_true')
 
@@ -132,7 +138,8 @@ class Config(object):
                                  nargs='?', const="default_browser", metavar='browser_name')
         self.parser.add_argument('--homepage', help='Web interface Homepage', default='1HeLLo4uzjaLetFx6NH3PMwFP3qbRbTf3D',
                                  metavar='address')
-        self.parser.add_argument('--size_limit', help='Default site size limit in MB', default=10, metavar='size')
+        self.parser.add_argument('--size_limit', help='Default site size limit in MB', default=10, type=int, metavar='size')
+        self.parser.add_argument('--connected_limit', help='Max connected peer per site', default=10, type=int, metavar='connected_limit')
 
         self.parser.add_argument('--fileserver_ip', help='FileServer bind address', default="*", metavar='ip')
         self.parser.add_argument('--fileserver_port', help='FileServer bind port', default=15441, type=int, metavar='port')
@@ -143,10 +150,13 @@ class Config(object):
         self.parser.add_argument('--trackers_file', help='Load torrent trackers dynamically from a file', default=False, metavar='path')
         self.parser.add_argument('--use_openssl', help='Use OpenSSL liblary for speedup',
                                  type='bool', choices=[True, False], default=use_openssl)
+        self.parser.add_argument('--disable_db', help='Disable database updating', action='store_true')
         self.parser.add_argument('--disable_encryption', help='Disable connection encryption', action='store_true')
         self.parser.add_argument('--disable_sslcompression', help='Disable SSL compression to save memory',
                                  type='bool', choices=[True, False], default=True)
         self.parser.add_argument('--keep_ssl_cert', help='Disable new SSL cert generation on startup', action='store_true')
+        self.parser.add_argument('--max_files_opened', help='Change maximum opened files allowed by OS to this value on startup',
+                                 default=2048, type=int, metavar='limit')
         self.parser.add_argument('--use_tempfiles', help='Use temporary files when downloading (experimental)',
                                  type='bool', choices=[True, False], default=False)
         self.parser.add_argument('--stream_downloads', help='Stream download directly to files (experimental)',

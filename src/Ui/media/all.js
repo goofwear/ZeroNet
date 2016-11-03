@@ -521,6 +521,7 @@ jQuery.extend( jQuery.easing,
 }).call(this);
 
 
+
 /* ---- src/Ui/media/Loading.coffee ---- */
 
 
@@ -532,15 +533,23 @@ jQuery.extend( jQuery.easing,
       if (window.show_loadingscreen) {
         this.showScreen();
       }
+      this.timer_hide = null;
     }
 
     Loading.prototype.setProgress = function(percent) {
+      if (this.timer_hide) {
+        clearInterval(this.timer_hide);
+      }
       return $(".progressbar").css("width", percent * 100 + "%").css("opacity", "1").css("display", "block");
     };
 
     Loading.prototype.hideProgress = function() {
       console.log("hideProgress");
-      return $(".progressbar").css("width", "100%").css("opacity", "0").hideLater(1000);
+      return this.timer_hide = setTimeout(((function(_this) {
+        return function() {
+          return $(".progressbar").css("width", "100%").css("opacity", "0").hideLater(1000);
+        };
+      })(this)), 300);
     };
 
     Loading.prototype.showScreen = function() {
@@ -781,7 +790,7 @@ jQuery.extend( jQuery.easing,
       this.wrapperWsInited = false;
       this.site_error = null;
       this.address = null;
-      this.opener = null;
+      this.opener_tested = false;
       window.onload = this.onLoad;
       window.onhashchange = (function(_this) {
         return function(e) {
@@ -796,8 +805,8 @@ jQuery.extend( jQuery.easing,
       window.onpopstate = (function(_this) {
         return function(e) {
           return _this.sendInner({
-            "cmd": "wrapperPopstate",
-            "result": {
+            "cmd": "wrapperPopState",
+            "params": {
               "href": document.location.href,
               "state": e.state
             }
@@ -830,11 +839,18 @@ jQuery.extend( jQuery.easing,
             return _this.ws.response(message.id, res);
           };
         })(this));
+      } else if (cmd === "confirm") {
+        return this.displayConfirm(message.params[0], message.params[1], (function(_this) {
+          return function(res) {
+            return _this.ws.response(message.id, res);
+          };
+        })(this));
       } else if (cmd === "setSiteInfo") {
         this.sendInner(message);
         if (message.params.address === this.address) {
-          return this.setSiteInfo(message.params);
+          this.setSiteInfo(message.params);
         }
+        return this.updateProgress(message.params);
       } else if (cmd === "error") {
         return this.notifications.add("notification-" + message.id, "error", message.params, 0);
       } else if (cmd === "updating") {
@@ -847,22 +863,21 @@ jQuery.extend( jQuery.easing,
 
     Wrapper.prototype.onMessageInner = function(e) {
       var cmd, message, query;
-      if (!window.postmessage_nonce_security && this.opener === null) {
-        if (window.opener) {
+      if (!window.postmessage_nonce_security && this.opener_tested === false) {
+        if (window.opener && window.opener !== window) {
           this.log("Opener present", window.opener);
           this.displayOpenerDialog();
           return false;
         } else {
-          this.opener = false;
+          this.opener_tested = true;
         }
       }
       message = e.data;
+      if (!message.cmd) {
+        return false;
+      }
       if (window.postmessage_nonce_security && message.wrapper_nonce !== window.wrapper_nonce) {
         this.log("Message nonce error:", message.wrapper_nonce, '!=', window.wrapper_nonce);
-        this.actionNotification({
-          "params": ["error", "Message wrapper_nonce error, please report!"]
-        });
-        window.removeEventListener("message", this.onMessageInner);
         return;
       }
       cmd = message.cmd;
@@ -905,6 +920,10 @@ jQuery.extend( jQuery.easing,
           "to": message.id,
           "result": window.history.state
         });
+      } else if (cmd === "wrapperOpenWindow") {
+        return this.actionOpenWindow(message.params);
+      } else if (cmd === "wrapperPermissionAdd") {
+        return this.actionPermissionAdd(message);
       } else {
         if (message.id < 1000000) {
           return this.ws.send(message);
@@ -943,6 +962,35 @@ jQuery.extend( jQuery.easing,
       return $("body").prepend(elem);
     };
 
+    Wrapper.prototype.actionOpenWindow = function(params) {
+      var w;
+      if (typeof params === "string") {
+        w = window.open();
+        w.opener = null;
+        return w.location = params;
+      } else {
+        w = window.open(null, params[1], params[2]);
+        w.opener = null;
+        return w.location = params[0];
+      }
+    };
+
+    Wrapper.prototype.actionPermissionAdd = function(message) {
+      var permission;
+      permission = message.params;
+      return this.displayConfirm("This site requests permission: <b>" + (this.toHtmlSafe(permission)) + "</b>", "Grant", (function(_this) {
+        return function() {
+          return _this.ws.cmd("permissionAdd", permission, function() {
+            return _this.sendInner({
+              "cmd": "response",
+              "to": message.id,
+              "result": "Granted"
+            });
+          });
+        };
+      })(this));
+    };
+
     Wrapper.prototype.actionNotification = function(message) {
       var body;
       message.params = this.toHtmlSafe(message.params);
@@ -954,7 +1002,12 @@ jQuery.extend( jQuery.easing,
       var body, button;
       body = $("<span class='message'>" + message + "</span>");
       button = $("<a href='#" + caption + "' class='button button-" + caption + "'>" + caption + "</a>");
-      button.on("click", cb);
+      button.on("click", (function(_this) {
+        return function() {
+          cb(true);
+          return false;
+        };
+      })(this));
       body.append(button);
       this.notifications.add("notification-" + caption, "ask", body);
       button.focus();
@@ -1038,6 +1091,10 @@ jQuery.extend( jQuery.easing,
       }
     };
 
+    Wrapper.prototype.actionReload = function(message) {
+      return this.reload();
+    };
+
     Wrapper.prototype.reload = function(url_post) {
       if (url_post == null) {
         url_post = "";
@@ -1080,7 +1137,12 @@ jQuery.extend( jQuery.easing,
 
     Wrapper.prototype.actionSetLocalStorage = function(message) {
       var back;
-      return back = localStorage.setItem("site." + this.site_info.address + "." + this.site_info.auth_address, JSON.stringify(message.params));
+      back = localStorage.setItem("site." + this.site_info.address + "." + this.site_info.auth_address, JSON.stringify(message.params));
+      return this.sendInner({
+        "cmd": "response",
+        "to": message.id,
+        "result": back
+      });
     };
 
     Wrapper.prototype.onOpenWebsocket = function(e) {
@@ -1118,6 +1180,8 @@ jQuery.extend( jQuery.easing,
           });
           if (e && e.code === 1000 && e.wasClean === false) {
             return _this.ws_error = _this.notifications.add("connection", "error", "UiServer Websocket error, please reload the page.");
+          } else if (e && e.code === 1001 && e.wasClean === true) {
+
           } else if (!_this.ws_error) {
             return _this.ws_error = _this.notifications.add("connection", "error", "Connection with <b>UiServer Websocket</b> was lost. Reconnecting...");
           }
@@ -1230,13 +1294,16 @@ jQuery.extend( jQuery.easing,
       if (this.loading.screen_visible && this.inner_loaded && site_info.settings.size < site_info.size_limit * 1024 * 1024 && site_info.settings.size > 0) {
         this.loading.hideScreen();
       }
-      if (site_info.tasks > 0 && site_info.started_task_num > 0) {
-        this.loading.setProgress(1 - (site_info.tasks / site_info.started_task_num));
-      } else {
-        this.loading.hideProgress();
-      }
       this.site_info = site_info;
       return this.event_site_info.resolve();
+    };
+
+    Wrapper.prototype.updateProgress = function(site_info) {
+      if (site_info.tasks > 0 && site_info.started_task_num > 0) {
+        return this.loading.setProgress(1 - (Math.max(site_info.tasks, site_info.bad_files) / site_info.started_task_num));
+      } else {
+        return this.loading.hideProgress();
+      }
     };
 
     Wrapper.prototype.toHtmlSafe = function(values) {
@@ -1294,7 +1361,7 @@ jQuery.extend( jQuery.easing,
 
   })();
 
-  origin = window.server_url || window.location.origin;
+  origin = window.server_url || window.location.href.replace(/(\:\/\/.*?)\/.*/, "$1");
 
   if (origin.indexOf("https:") === 0) {
     proto = {

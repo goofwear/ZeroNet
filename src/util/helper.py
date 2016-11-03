@@ -1,4 +1,5 @@
 import os
+import stat
 import socket
 import struct
 import re
@@ -10,6 +11,7 @@ import base64
 
 def atomicWrite(dest, content, mode="w"):
     try:
+        permissions = stat.S_IMODE(os.lstat(dest).st_mode)
         with open(dest + "-new", mode) as f:
             f.write(content)
             f.flush()
@@ -18,6 +20,7 @@ def atomicWrite(dest, content, mode="w"):
             os.rename(dest + "-old", dest + "-old-%s" % time.time())
         os.rename(dest, dest + "-old")
         os.rename(dest + "-new", dest)
+        os.chmod(dest, permissions)
         os.unlink(dest + "-old")
         return True
     except Exception, err:
@@ -86,16 +89,15 @@ def unpackOnionAddress(packed):
 # Get dir from file
 # Return: data/site/content.json -> data/site
 def getDirname(path):
-    file_dir = re.sub("[^/]*?$", "", path).rstrip("/")
-    if file_dir:
-        file_dir += "/"  # Add / at end if its not the root
-    return file_dir
-
+    if "/" in path:
+        return path[:path.rfind("/")+1]
+    else:
+        return ""
 
 # Get dir from file
 # Return: data/site/content.json -> content.json
 def getFilename(path):
-    return re.sub("^.*/", "", path)
+    return path[path.rfind("/")+1:]
 
 
 # Convert hash to hashid for hashfield
@@ -129,6 +131,9 @@ def httpRequest(url, as_file=False):
         conn.sock = ssl.wrap_socket(sock, conn.key_file, conn.cert_file)
         conn.request("GET", request)
         response = conn.getresponse()
+        if response.status in [301, 302, 303, 307, 308]:
+            logging.info("Redirect to: %s" % response.getheader('Location'))
+            response = httpRequest(response.getheader('Location'))
 
     if as_file:
         import cStringIO as StringIO
