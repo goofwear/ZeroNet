@@ -19,12 +19,14 @@ class SiteManager(object):
         self.log = logging.getLogger("SiteManager")
         self.log.debug("SiteManager created.")
         self.sites = None
+        self.loaded = False
         gevent.spawn(self.saveTimer)
         atexit.register(self.save)
 
     # Load all sites from data/sites.json
     def load(self, cleanup=True):
         self.log.debug("Loading sites...")
+        self.loaded = False
         from Site import Site
         if self.sites is None:
             self.sites = {}
@@ -34,7 +36,13 @@ class SiteManager(object):
         for address, settings in json.load(open("%s/sites.json" % config.data_dir)).iteritems():
             if address not in self.sites and os.path.isfile("%s/%s/content.json" % (config.data_dir, address)):
                 s = time.time()
-                self.sites[address] = Site(address, settings=settings)
+                try:
+                    site = Site(address, settings=settings)
+                    site.content_manager.contents.get("content.json")
+                except Exception, err:
+                    self.log.debug("Error loading site %s: %s" % (address, err))
+                    continue
+                self.sites[address] = site
                 self.log.debug("Loaded site %s in %.3fs" % (address, time.time() - s))
                 added += 1
             address_found.append(address)
@@ -47,17 +55,28 @@ class SiteManager(object):
                     self.log.debug("Removed site: %s" % address)
 
             # Remove orpan sites from contentdb
-            for row in ContentDb.getContentDb().execute("SELECT * FROM site"):
-                if row["address"] not in self.sites:
-                    self.log.info("Deleting orphan site from content.db: %s" % row["address"])
-                    ContentDb.getContentDb().deleteSite(row["address"])
+            content_db = ContentDb.getContentDb()
+            for row in content_db.execute("SELECT * FROM site"):
+                address = row["address"]
+                if address not in self.sites:
+                    self.log.info("Deleting orphan site from content.db: %s" % address)
+                    content_db.execute("DELETE FROM site WHERE ?", {"address": address})
+                    if address in content_db.site_ids:
+                        del content_db.site_ids[address]
+                    if address in content_db.sites:
+                        del content_db.sites[address]
 
         if added:
             self.log.debug("SiteManager added %s sites" % added)
+        self.loaded = True
 
     def save(self):
         if not self.sites:
-            self.log.debug("Save: No sites found")
+            self.log.debug("Save skipped: No sites found")
+            return
+        if not self.loaded:
+            self.log.debug("Save skipped: Not loaded")
+            return
         s = time.time()
         data = {}
         # Generate data file
@@ -68,7 +87,10 @@ class SiteManager(object):
             data[address]["cache"]["bad_files"] = site.bad_files
             data[address]["cache"]["hashfield"] = site.content_manager.hashfield.tostring().encode("base64")
 
-        helper.atomicWrite("%s/sites.json" % config.data_dir, json.dumps(data, indent=2, sort_keys=True))
+        if data:
+            helper.atomicWrite("%s/sites.json" % config.data_dir, json.dumps(data, indent=2, sort_keys=True))
+        else:
+            self.log.debug("Save error: No data")
         # Remove cache from site settings
         for address, site in self.list().iteritems():
             site.settings["cache"] = {}
@@ -83,6 +105,9 @@ class SiteManager(object):
     # Checks if its a valid address
     def isAddress(self, address):
         return re.match("^[A-Za-z0-9]{26,35}$", address)
+
+    def isDomain(self, address):
+        return False
 
     # Return: Site object or None if not found
     def get(self, address):
@@ -110,10 +135,10 @@ class SiteManager(object):
                 site.settings["serving"] = True
             site.saveSettings()
             if all_file:  # Also download user files on first sync
-                site.download(blind_includes=True)
+                site.download(check_size=True, blind_includes=True)
         else:
             if all_file:
-                site.download()
+                site.download(check_size=True, blind_includes=True)
 
         return site
 
